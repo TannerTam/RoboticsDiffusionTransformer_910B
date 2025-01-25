@@ -22,6 +22,11 @@ AGILEX_STATE_INDICES = [
     STATE_VEC_IDX_MAPPING[f"right_gripper_open"]
 ]
 
+AGILEX_RIGHT_STATE_INDICES = [
+    STATE_VEC_IDX_MAPPING[f"right_arm_joint_{i}_pos"] for i in range(6)
+] + [
+    STATE_VEC_IDX_MAPPING[f"right_gripper_open"]
+]
 
 # Create the RDT model
 def create_model(args, **kwargs):
@@ -49,6 +54,7 @@ class RoboticDiffusionTransformerModel(object):
         control_frequency=25,
         pretrained=None,
         pretrained_vision_encoder_name_or_path=None,
+        right=False,
     ):
         self.args = args
         self.dtype = dtype
@@ -59,6 +65,7 @@ class RoboticDiffusionTransformerModel(object):
         # self.text_tokenizer, self.text_model = self.get_text_encoder(pretrained_text_encoder_name_or_path)
         self.image_processor, self.vision_model = self.get_vision_encoder(pretrained_vision_encoder_name_or_path)
         self.policy = self.get_policy(pretrained)
+        self.right=right
         
         self.reset()
 
@@ -184,13 +191,19 @@ class RoboticDiffusionTransformerModel(object):
             device=joints.device, dtype=joints.dtype
         )
         # Fill into the unified state vector
-        state[:, :, AGILEX_STATE_INDICES] = joints
+        if self.right:
+            state[:, :, AGILEX_RIGHT_STATE_INDICES] = joints[..., 7:14]
+        else:
+            state[:, :, AGILEX_STATE_INDICES] = joints
         # Assemble the mask indicating each dimension's availability 
         state_elem_mask = torch.zeros(
             (B, self.args["model"]["state_token_dim"]),
             device=joints.device, dtype=joints.dtype
         )
-        state_elem_mask[:, AGILEX_STATE_INDICES] = 1
+        if self.right:
+            state_elem_mask[:, AGILEX_RIGHT_STATE_INDICES] = 1
+        else:
+            state_elem_mask[:, AGILEX_STATE_INDICES] = 1
         return state, state_elem_mask
 
     def _unformat_action_to_joint(self, action):

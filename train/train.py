@@ -18,6 +18,8 @@ import logging
 import math
 import os
 from pathlib import Path
+import fnmatch
+import numpy as np
 
 import diffusers
 import torch
@@ -38,7 +40,8 @@ from models.multimodal_encoder.t5_encoder import T5Embedder
 from models.rdt_runner import RDTRunner
 from train.dataset import DataCollatorForVLAConsumerDataset, VLAConsumerDataset
 from train.sample import log_sample_res
-
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 
 if is_wandb_available():
     import wandb
@@ -89,6 +92,7 @@ def train(args, logger):
         log_with=args.report_to,
         project_dir=logging_dir,
         project_config=accelerator_project_config,
+        # num_process = 2,
     )
 
     if args.report_to == "wandb":
@@ -235,6 +239,24 @@ def train(args, logger):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    if args.load_from_hdf5:
+        file_paths = []
+        HDF5_DIR = "data/datasets/airbot/dataset/"
+        for root, _, files in os.walk(HDF5_DIR):
+            for filename in fnmatch.filter(files, '*.hdf5'):
+                file_path = os.path.join(root, filename)
+                file_paths.append(file_path)
+        
+        indices = np.arange(len(file_paths))
+        np.random.seed(args.seed)
+        np.random.shuffle(indices)
+
+        split = int(len(indices) * args.transet_weight)
+        hdf5_file_paths_trainset = [file_paths[i] for i in indices[:split]]
+        hdf5_file_paths_testset = [file_paths[i] for i in indices[split:]]
+    else:
+        hdf5_file_paths_trainset = None
+        hdf5_file_paths_testset = None
     
     # Dataset and DataLoaders creation:                                                           
     train_dataset = VLAConsumerDataset(
@@ -250,6 +272,7 @@ def train(args, logger):
         state_noise_snr=args.state_noise_snr,
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
+        hdf5_file_paths=hdf5_file_paths_trainset,
     )
     sample_dataset = VLAConsumerDataset(
         config=config["dataset"],
@@ -264,6 +287,7 @@ def train(args, logger):
         state_noise_snr=None,
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
+        hdf5_file_paths=hdf5_file_paths_testset,
     )                              
     
     data_collator = DataCollatorForVLAConsumerDataset(tokenizer)                                                        

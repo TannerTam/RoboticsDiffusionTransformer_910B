@@ -5,6 +5,8 @@ in `pretrain_datasets.json` or `pretrain_datasets.json`.
 
 import json
 import argparse
+import os
+import fnmatch
 
 import numpy as np
 from tqdm import tqdm
@@ -74,11 +76,21 @@ if __name__ == "__main__":
     parser.add_argument('--save_path', type=str, 
                         default="configs/dataset_stat.json", 
                         help="JSON file path to save the dataset statistics.")
-    parser.add_argument('--skip_exist', action='store_true', 
+    parser.add_argument('--skip_exist', action='store_true', default=True,
                         help="Whether to skip the existing dataset statistics.")
+    parser.add_argument('--seed', type=int, default=429)
+    parser.add_argument('--transet_weight', type=float, default=0.9)
     args = parser.parse_args()
+
+
+    file_paths = []
+    HDF5_DIR = "data/datasets/airbot/dataset/"
+    for root, _, files in os.walk(HDF5_DIR):
+        for filename in fnmatch.filter(files, '*.hdf5'):
+            file_path = os.path.join(root, filename)
+            file_paths.append(file_path)
     
-    vla_dataset = HDF5VLADataset()
+    vla_dataset = HDF5VLADataset(file_paths)
     dataset_name = vla_dataset.get_dataset_name()
     
     try:

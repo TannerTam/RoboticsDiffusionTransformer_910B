@@ -3,6 +3,7 @@ import os
 from train.train import train
 
 from accelerate.logging import get_logger
+from accelerate import notebook_launcher
 
 
 def parse_args(input_args=None):
@@ -16,34 +17,34 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--deepspeed",
         type=str,
-        default=None,
+        default="./configs/zero2.json",
         help="Enable DeepSpeed and pass the path to its config file or an already initialized DeepSpeed config dictionary",
     )
     parser.add_argument(
         "--pretrained_text_encoder_name_or_path",
         type=str,
-        default=None,
+        default="google/t5-v1_1-xxl",
         help="Pretrained text encoder name or path if not the same as model_name",
     )
     parser.add_argument(
         "--pretrained_vision_encoder_name_or_path",
         type=str,
-        default=None,
+        default="google/siglip-so400m-patch14-384",
         help="Pretrained vision encoder name or path if not the same as model_name",
     )
     
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="checkpoints",
+        default="./checkpoints/rdt-finetune-airbot/stack_block",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=429, help="A seed for reproducible training.")
 
     parser.add_argument(
         "--load_from_hdf5",
         action="store_true",
-        default=False,
+        default=True,
         help=(
             "Whether to load the dataset directly from HDF5 files. "
             "If False, the dataset will be loaded using producer-consumer pattern, "
@@ -63,13 +64,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=None,
+        default=400000,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
         "--checkpointing_period",
         type=int,
-        default=500,
+        default=100,
         help=(
             "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
             "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
@@ -81,7 +82,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
+        default=40,
         help=(
             "Max number of checkpoints to store. Passed as `total_limit` to the `Accelerator` `ProjectConfiguration`."
             " See Accelerator::save_state https://huggingface.co/docs/accelerate/package_reference/accelerator#accelerate.Accelerator.save_state"
@@ -100,7 +101,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
+        default="robotics-diffusion-transformer/rdt-1b",
         help=(
             "Path or name of a pretrained checkpoint to load the model from.\n",
             "   This can be either:\n"
@@ -124,7 +125,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-6,
+        default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -148,7 +149,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--state_noise_snr",
         type=float,
-        default=None,
+        default=40,
         help=(
             "The signal-to-noise ratio (SNR, unit: dB) for adding noise to the states. "
             "Default is None, which means no noise is added."
@@ -157,7 +158,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--image_aug",
         action="store_true",
-        default=False,
+        default=True,
         help="Whether or not to apply image augmentation (ColorJitter, blur, noise, etc) to the input images.",
     )
     parser.add_argument(
@@ -192,12 +193,12 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
     parser.add_argument(
-        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+        "--use_8bit_adam", action="store_true", default=False, help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=12,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -236,7 +237,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--report_to",
         type=str,
-        default="tensorboard",
+        default="wandb",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`'
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
@@ -245,7 +246,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--sample_period",
         type=int,
-        default=-1,
+        default=100,
         help=(
             "Run sampling every X steps. During the sampling phase, the model will sample a trajectory"
             " and report the error between the sampled trajectory and groud-truth trajectory"
@@ -255,7 +256,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="bf16",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -277,9 +278,16 @@ def parse_args(input_args=None):
 
     parser.add_argument('--dataset_type', 
         type=str, 
-        default="pretrain",
+        default="finetune",
         required=False,
         help="Whether to load the pretrain dataset or finetune dataset."
+    )
+
+    parser.add_argument('--transet_weight', 
+        type=float, 
+        default=0.9,
+        required=False,
+        help="The weight of trainset in the total dataset."
     )
 
     if input_args is not None:
@@ -295,6 +303,15 @@ def parse_args(input_args=None):
 
 
 if __name__ == "__main__":
-    logger = get_logger(__name__)
+    # os.environ['TEXT_ENCODER_NAME']="google/t5-v1_1-xxl"
+    # os.environ['VISION_ENCODER_NAME']="google/siglip-so400m-patch14-384"
+    # os.environ['OUTPUT_DIR']="./checkpoints/rdt-finetune-airbot/stack_block"
+    # os.environ['CFLAGS']="-I/usr/include"
+    # os.environ['LDFLAGS']="-L/usr/lib/aarch64-linux-gnu"
+    # os.environ['WANDB_PROJECT']="robotic_diffusion_transformer"
+    # os.environ['WANDB_MODE'] = 'offline'
+    logger = get_logger(__name__, "INFO")
     args = parse_args()
+    # Args = (args, logger)
+    # notebook_launcher(train, Args, num_processes=2)
     train(args, logger)

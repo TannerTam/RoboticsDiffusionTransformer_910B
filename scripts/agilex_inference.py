@@ -36,277 +36,15 @@ lang_embeddings = None
 preload_images = None
 
 
-# Initialize the model
-def make_policy(args):
-    with open(args.config_path, "r") as fp:
-        config = yaml.safe_load(fp)
-    args.config = config
-    
-    # pretrained_text_encoder_name_or_path = "google/t5-v1_1-xxl"
-    pretrained_vision_encoder_name_or_path = "google/siglip-so400m-patch14-384"
-    model = create_model(
-        args=args.config, 
-        dtype=torch.bfloat16,
-        pretrained=args.pretrained_model_name_or_path,
-        # pretrained_text_encoder_name_or_path=pretrained_text_encoder_name_or_path,
-        pretrained_vision_encoder_name_or_path=pretrained_vision_encoder_name_or_path,
-        control_frequency=args.ctrl_freq,
-    )
-
-    return model
-
-
-def set_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-
-# Interpolate the actions to make the robot move smoothly
-def interpolate_action(args, prev_action, cur_action):
-    steps = np.concatenate((np.array(args.arm_steps_length), np.array(args.arm_steps_length)), axis=0)
-    diff = np.abs(cur_action - prev_action)
-    step = np.ceil(diff / steps).astype(int)
-    step = np.max(step)
-    if step <= 1:
-        return cur_action[np.newaxis, :]
-    new_actions = np.linspace(prev_action, cur_action, step + 1)
-    return new_actions[1:]
-
-
-def get_config(args):
-    config = {
-        'episode_len': args.max_publish_step,
-        'state_dim': 14,
-        'chunk_size': args.chunk_size,
-        'camera_names': CAMERA_NAMES,
-    }
-    return config
-
-
-# Get the observation from the ROS topic
-def get_ros_observation(args,ros_operator):
-    rate = rospy.Rate(args.publish_rate)
-    print_flag = True
-
-    while True and not rospy.is_shutdown():
-        result = ros_operator.get_frame()
-        if not result:
-            if print_flag:
-                print("syn fail when get_ros_observation")
-                print_flag = False
-            rate.sleep()
-            continue
-        print_flag = True
-        (img_front, img_left, img_right, img_front_depth, img_left_depth, img_right_depth,
-         puppet_arm_left, puppet_arm_right, robot_base) = result
-        # print(f"sync success when get_ros_observation")
-        return (img_front, img_left, img_right,
-         puppet_arm_left, puppet_arm_right)
-
-
-# Update the observation window buffer
-def update_observation_window(args, config, ros_operator):
-    # JPEG transformation
-    # Align with training
-    def jpeg_mapping(img):
-        img = cv2.imencode('.jpg', img)[1].tobytes()
-        img = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
-        return img
-    
-    global observation_window
-    if observation_window is None:
-        observation_window = deque(maxlen=2)
-    
-        # Append the first dummy image
-        observation_window.append(
-            {
-                'qpos': None,
-                'images':
-                    {
-                        config["camera_names"][0]: None,
-                        config["camera_names"][1]: None,
-                        config["camera_names"][2]: None,
-                    },
-            }
-        )
-        
-    img_front, img_left, img_right, puppet_arm_left, puppet_arm_right = get_ros_observation(args,ros_operator)
-    img_front = jpeg_mapping(img_front)
-    img_left = jpeg_mapping(img_left)
-    img_right = jpeg_mapping(img_right)
-    
-    qpos = np.concatenate(
-            (np.array(puppet_arm_left.position), np.array(puppet_arm_right.position)), axis=0)
-    qpos = torch.from_numpy(qpos).float().cuda()
-    observation_window.append(
-        {
-            'qpos': qpos,
-            'images':
-                {
-                    config["camera_names"][0]: img_front,
-                    config["camera_names"][1]: img_right,
-                    config["camera_names"][2]: img_left,
-                },
-        }
-    )
-
-
-# RDT inference
-def inference_fn(args, config, policy, t):
-    global observation_window
-    global lang_embeddings
-    
-    # print(f"Start inference_thread_fn: t={t}")
-    while True and not rospy.is_shutdown():
-        time1 = time.time()     
-
-        # fetch images in sequence [front, right, left]
-        image_arrs = [
-            observation_window[-2]['images'][config['camera_names'][0]],
-            observation_window[-2]['images'][config['camera_names'][1]],
-            observation_window[-2]['images'][config['camera_names'][2]],
-            
-            observation_window[-1]['images'][config['camera_names'][0]],
-            observation_window[-1]['images'][config['camera_names'][1]],
-            observation_window[-1]['images'][config['camera_names'][2]]
-        ]
-        
-        # fetch debug images in sequence [front, right, left]
-        # image_arrs = [
-        #     preload_images[config['camera_names'][0]][max(t - 1, 0)],
-        #     preload_images[config['camera_names'][2]][max(t - 1, 0)],
-        #     preload_images[config['camera_names'][1]][max(t - 1, 0)],
-        #     preload_images[config['camera_names'][0]][t],
-        #     preload_images[config['camera_names'][2]][t],
-        #     preload_images[config['camera_names'][1]][t]
-        # ]
-        # # encode the images
-        # for i in range(len(image_arrs)):
-        #     image_arrs[i] = cv2.imdecode(np.frombuffer(image_arrs[i], np.uint8), cv2.IMREAD_COLOR)
-        # proprio = torch.from_numpy(preload_images['qpos'][t]).float().cuda()
-        
-        images = [PImage.fromarray(arr) if arr is not None else None
-                  for arr in image_arrs]
-        
-        # for i, pos in enumerate(['f', 'r', 'l'] * 2):
-        #     images[i].save(f'{t}-{i}-{pos}.png')
-        
-        # get last qpos in shape [14, ]
-        proprio = observation_window[-1]['qpos']
-        # unsqueeze to [1, 14]
-        proprio = proprio.unsqueeze(0)
-        
-        # actions shaped as [1, 64, 14] in format [left, right]
-        actions = policy.step(
-            proprio=proprio,
-            images=images,
-            text_embeds=lang_embeddings 
-        ).squeeze(0).cpu().numpy()
-        # print(f"inference_actions: {actions.squeeze()}")
-        
-        print(f"Model inference time: {time.time() - time1} s")
-        
-        # print(f"Finish inference_thread_fn: t={t}")
-        return actions
-
-
-# Main loop for the manipulation task
-def model_inference(args, config, ros_operator):
-    global lang_embeddings
-    
-    # Load rdt model
-    policy = make_policy(args)
-    
-    lang_dict = torch.load(args.lang_embeddings_path)
-    print(f"Running with instruction: \"{lang_dict['instruction']}\" from \"{lang_dict['name']}\"")
-    lang_embeddings = lang_dict["embeddings"]
-    
-    max_publish_step = config['episode_len']
-    chunk_size = config['chunk_size']
-
-    # Initialize position of the puppet arm
-    left0 = [-0.00133514404296875, 0.00209808349609375, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, 3.557830810546875]
-    right0 = [-0.00133514404296875, 0.00438690185546875, 0.034523963928222656, -0.053597450256347656, -0.00476837158203125, -0.00209808349609375, 3.557830810546875]
-    left1 = [-0.00133514404296875, 0.00209808349609375, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, -0.3393220901489258]
-    right1 = [-0.00133514404296875, 0.00247955322265625, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, -0.3397035598754883]
-    ros_operator.puppet_arm_publish_continuous(left0, right0)
-    input("Press enter to continue")
-    ros_operator.puppet_arm_publish_continuous(left1, right1)
-    # Initialize the previous action to be the initial robot state
-    pre_action = np.zeros(config['state_dim'])
-    pre_action[:14] = np.array(
-        [-0.00133514404296875, 0.00209808349609375, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, -0.3393220901489258] + 
-        [-0.00133514404296875, 0.00247955322265625, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, -0.3397035598754883]
-    )
-    action = None
-    # Inference loop
-    with torch.inference_mode():
-        while True and not rospy.is_shutdown():
-            # The current time step
-            t = 0
-            rate = rospy.Rate(args.publish_rate)
-    
-            action_buffer = np.zeros([chunk_size, config['state_dim']])
-            
-            while t < max_publish_step and not rospy.is_shutdown():
-                # Update observation window
-                update_observation_window(args, config, ros_operator)
-                
-                # When coming to the end of the action chunk
-                if t % chunk_size == 0:
-                    # Start inference
-                    action_buffer = inference_fn(args, config, policy, t).copy()
-                
-                raw_action = action_buffer[t % chunk_size]
-                action = raw_action
-                # Interpolate the original action sequence
-                if args.use_actions_interpolation:
-                    # print(f"Time {t}, pre {pre_action}, act {action}")
-                    interp_actions = interpolate_action(args, pre_action, action)
-                else:
-                    interp_actions = action[np.newaxis, :]
-                # Execute the interpolated actions one by one
-                for act in interp_actions:
-                    left_action = act[:7]
-                    right_action = act[7:14]
-                    
-                    if not args.disable_puppet_arm:
-                        ros_operator.puppet_arm_publish(left_action, right_action)  # puppet_arm_publish_continuous_thread
-                
-                    if args.use_robot_base:
-                        vel_action = act[14:16]
-                        ros_operator.robot_base_publish(vel_action)
-                    rate.sleep()
-                    # print(f"doing action: {act}")
-                t += 1
-                
-                print("Published Step", t)
-                pre_action = action.copy()
-
-
 # ROS operator class
 class RosOperator:
     def __init__(self, args):
-        self.robot_base_deque = None
-        self.puppet_arm_right_deque = None
-        self.puppet_arm_left_deque = None
-        self.img_front_deque = None
-        self.img_right_deque = None
-        self.img_left_deque = None
-        self.img_front_depth_deque = None
-        self.img_right_depth_deque = None
-        self.img_left_depth_deque = None
-        self.bridge = None
-        self.puppet_arm_left_publisher = None
-        self.puppet_arm_right_publisher = None
-        self.robot_base_publisher = None
-        self.puppet_arm_publish_thread = None
-        self.puppet_arm_publish_lock = None
         self.args = args
         self.init()
         self.init_ros()
 
     def init(self):
+        self.right = self.args.right
         self.bridge = CvBridge()
         self.img_left_deque = deque()
         self.img_right_deque = deque()
@@ -320,15 +58,27 @@ class RosOperator:
         self.puppet_arm_publish_lock = threading.Lock()
         self.puppet_arm_publish_lock.acquire()
 
+    def init_ros(self):
+        rospy.init_node('joint_state_publisher', anonymous=True)
+        rospy.Subscriber(self.args.img_left_topic, Image, self.img_left_callback, queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.img_right_topic, Image, self.img_right_callback, queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.img_front_topic, Image, self.img_front_callback, queue_size=1000, tcp_nodelay=True)
+        if self.args.use_depth_image:
+            rospy.Subscriber(self.args.img_left_depth_topic, Image, self.img_left_depth_callback, queue_size=1000, tcp_nodelay=True)
+            rospy.Subscriber(self.args.img_right_depth_topic, Image, self.img_right_depth_callback, queue_size=1000, tcp_nodelay=True)
+            rospy.Subscriber(self.args.img_front_depth_topic, Image, self.img_front_depth_callback, queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.puppet_arm_left_topic, JointState, self.puppet_arm_left_callback, queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.puppet_arm_right_topic, JointState, self.puppet_arm_right_callback, queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(self.args.robot_base_topic, Odometry, self.robot_base_callback, queue_size=1000, tcp_nodelay=True)
+        self.puppet_arm_publisher = rospy.Publisher(self.args.puppet_arm_cmd_topic, JointState, queue_size=100)
+        self.robot_base_publisher = rospy.Publisher(self.args.robot_base_cmd_topic, Twist, queue_size=10)
+
     def puppet_arm_publish(self, left, right):
         joint_state_msg = JointState()
         joint_state_msg.header = Header()
         joint_state_msg.header.stamp = rospy.Time.now()  # Set timestep
-        joint_state_msg.name = ['joint0', 'joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']  # 设置关节名称
-        joint_state_msg.position = left
-        self.puppet_arm_left_publisher.publish(joint_state_msg)
-        joint_state_msg.position = right
-        self.puppet_arm_right_publisher.publish(joint_state_msg)
+        joint_state_msg.position = np.concatenate((left, right))
+        self.puppet_arm_publisher.publish(joint_state_msg)
 
     def robot_base_publish(self, vel):
         vel_msg = Twist()
@@ -341,10 +91,13 @@ class RosOperator:
         self.robot_base_publisher.publish(vel_msg)
 
     def puppet_arm_publish_continuous(self, left, right):
+        "持续发布机械臂的关节状态，直到它们到达预定目标位置"
         rate = rospy.Rate(self.args.publish_rate)
         left_arm = None
         right_arm = None
         while True and not rospy.is_shutdown():
+            if self.right:
+                left_arm = left
             if len(self.puppet_arm_left_deque) != 0:
                 left_arm = list(self.puppet_arm_left_deque[-1].position)
             if len(self.puppet_arm_right_deque) != 0:
@@ -379,16 +132,15 @@ class RosOperator:
             joint_state_msg = JointState()
             joint_state_msg.header = Header()
             joint_state_msg.header.stamp = rospy.Time.now()  # Set the timestep
-            joint_state_msg.name = ['joint0', 'joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']  # 设置关节名称
-            joint_state_msg.position = left_arm
-            self.puppet_arm_left_publisher.publish(joint_state_msg)
-            joint_state_msg.position = right_arm
-            self.puppet_arm_right_publisher.publish(joint_state_msg)
+            joint_state_msg.position = left_arm + right_arm
+            self.puppet_arm_publisher.publish(joint_state_msg)
             step += 1
-            print("puppet_arm_publish_continuous:", step)
+            print("puppet_arm_publish_continuous:", step, left_arm, right_arm)
             rate.sleep()
 
     def puppet_arm_publish_linear(self, left, right):
+        "通过线性插值将机械臂从当前位置平滑移动到目标位置"
+        raise NotImplementedError
         num_step = 100
         rate = rospy.Rate(200)
 
@@ -554,21 +306,263 @@ class RosOperator:
             self.robot_base_deque.popleft()
         self.robot_base_deque.append(msg)
 
-    def init_ros(self):
-        rospy.init_node('joint_state_publisher', anonymous=True)
-        rospy.Subscriber(self.args.img_left_topic, Image, self.img_left_callback, queue_size=1000, tcp_nodelay=True)
-        rospy.Subscriber(self.args.img_right_topic, Image, self.img_right_callback, queue_size=1000, tcp_nodelay=True)
-        rospy.Subscriber(self.args.img_front_topic, Image, self.img_front_callback, queue_size=1000, tcp_nodelay=True)
-        if self.args.use_depth_image:
-            rospy.Subscriber(self.args.img_left_depth_topic, Image, self.img_left_depth_callback, queue_size=1000, tcp_nodelay=True)
-            rospy.Subscriber(self.args.img_right_depth_topic, Image, self.img_right_depth_callback, queue_size=1000, tcp_nodelay=True)
-            rospy.Subscriber(self.args.img_front_depth_topic, Image, self.img_front_depth_callback, queue_size=1000, tcp_nodelay=True)
-        rospy.Subscriber(self.args.puppet_arm_left_topic, JointState, self.puppet_arm_left_callback, queue_size=1000, tcp_nodelay=True)
-        rospy.Subscriber(self.args.puppet_arm_right_topic, JointState, self.puppet_arm_right_callback, queue_size=1000, tcp_nodelay=True)
-        rospy.Subscriber(self.args.robot_base_topic, Odometry, self.robot_base_callback, queue_size=1000, tcp_nodelay=True)
-        self.puppet_arm_left_publisher = rospy.Publisher(self.args.puppet_arm_left_cmd_topic, JointState, queue_size=10)
-        self.puppet_arm_right_publisher = rospy.Publisher(self.args.puppet_arm_right_cmd_topic, JointState, queue_size=10)
-        self.robot_base_publisher = rospy.Publisher(self.args.robot_base_cmd_topic, Twist, queue_size=10)
+
+# Initialize the model
+def make_policy(args):
+    with open(args.config_path, "r") as fp:
+        config = yaml.safe_load(fp)
+    args.config = config
+    
+    # pretrained_text_encoder_name_or_path = "google/t5-v1_1-xxl"
+    pretrained_vision_encoder_name_or_path = "google/siglip-so400m-patch14-384"
+    model = create_model(
+        args=args.config, 
+        dtype=torch.bfloat16,
+        pretrained=args.pretrained_model_name_or_path,
+        # pretrained_text_encoder_name_or_path=pretrained_text_encoder_name_or_path,
+        pretrained_vision_encoder_name_or_path=pretrained_vision_encoder_name_or_path,
+        control_frequency=args.ctrl_freq,
+        right=args.right,
+    )
+
+    return model
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+
+# Interpolate the actions to make the robot move smoothly
+def interpolate_action(args, prev_action, cur_action):
+    steps = np.concatenate((np.array(args.arm_steps_length), np.array(args.arm_steps_length)), axis=0)
+    diff = np.abs(cur_action - prev_action)
+    step = np.ceil(diff / steps).astype(int)
+    step = np.max(step)
+    if step <= 1:
+        return cur_action[np.newaxis, :]
+    new_actions = np.linspace(prev_action, cur_action, step + 1)
+    return new_actions[1:]
+
+
+def get_config(args):
+    config = {
+        'episode_len': args.max_publish_step,
+        'state_dim': 14,
+        'chunk_size': args.chunk_size,
+        'camera_names': CAMERA_NAMES,
+    }
+    return config
+
+
+# Get the observation from the ROS topic
+def get_ros_observation(args,ros_operator):
+    rate = rospy.Rate(args.publish_rate)
+    print_flag = True
+
+    while True and not rospy.is_shutdown():
+        result = ros_operator.get_frame()
+        if not result:
+            if print_flag:
+                print("syn fail when get_ros_observation")
+                print_flag = False
+            rate.sleep()
+            continue
+        print_flag = True
+        (img_front, img_left, img_right, img_front_depth, img_left_depth, img_right_depth,
+         puppet_arm_left, puppet_arm_right, robot_base) = result
+        # print(f"sync success when get_ros_observation")
+        return (img_front, img_left, img_right,
+         puppet_arm_left, puppet_arm_right)
+
+
+# Update the observation window buffer
+def update_observation_window(args, config, ros_operator):
+    # JPEG transformation
+    # Align with training
+    def jpeg_mapping(img):
+        img = cv2.imencode('.jpg', img)[1].tobytes()
+        img = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+        return img
+    
+    global observation_window
+    if observation_window is None:
+        observation_window = deque(maxlen=2)
+    
+        # Append the first dummy image
+        observation_window.append(
+            {
+                'qpos': None,
+                'images':
+                    {
+                        config["camera_names"][0]: None,
+                        config["camera_names"][1]: None,
+                        config["camera_names"][2]: None,
+                    },
+            }
+        )
+        
+    img_front, img_left, img_right, puppet_arm_left, puppet_arm_right = get_ros_observation(args,ros_operator)
+    img_front = jpeg_mapping(img_front)
+    img_left = jpeg_mapping(img_left)
+    img_right = jpeg_mapping(img_right)
+    
+    qpos = np.concatenate(
+            (np.array(puppet_arm_left.position), np.array(puppet_arm_right.position)), axis=0)
+    qpos = torch.from_numpy(qpos).float().cuda()
+    observation_window.append(
+        {
+            'qpos': qpos,
+            'images':
+                {
+                    config["camera_names"][0]: img_front,
+                    config["camera_names"][1]: img_right,
+                    config["camera_names"][2]: img_left,
+                },
+        }
+    )
+
+
+# RDT inference
+def inference_fn(args, config, policy, t):
+    global observation_window
+    global lang_embeddings
+    
+    # print(f"Start inference_thread_fn: t={t}")
+    while True and not rospy.is_shutdown():
+        time1 = time.time()     
+
+        # fetch images in sequence [front, right, left]
+        image_arrs = [
+            observation_window[-2]['images'][config['camera_names'][0]],
+            observation_window[-2]['images'][config['camera_names'][1]],
+            observation_window[-2]['images'][config['camera_names'][2]],
+            
+            observation_window[-1]['images'][config['camera_names'][0]],
+            observation_window[-1]['images'][config['camera_names'][1]],
+            observation_window[-1]['images'][config['camera_names'][2]]
+        ]
+        
+        # fetch debug images in sequence [front, right, left]
+        # image_arrs = [
+        #     preload_images[config['camera_names'][0]][max(t - 1, 0)],
+        #     preload_images[config['camera_names'][2]][max(t - 1, 0)],
+        #     preload_images[config['camera_names'][1]][max(t - 1, 0)],
+        #     preload_images[config['camera_names'][0]][t],
+        #     preload_images[config['camera_names'][2]][t],
+        #     preload_images[config['camera_names'][1]][t]
+        # ]
+        # # encode the images
+        # for i in range(len(image_arrs)):
+        #     image_arrs[i] = cv2.imdecode(np.frombuffer(image_arrs[i], np.uint8), cv2.IMREAD_COLOR)
+        # proprio = torch.from_numpy(preload_images['qpos'][t]).float().cuda()
+        
+        images = [PImage.fromarray(arr) if arr is not None else None
+                  for arr in image_arrs]
+        
+        # for i, pos in enumerate(['f', 'r', 'l'] * 2):
+        #     images[i].save(f'{t}-{i}-{pos}.png')
+        
+        # get last qpos in shape [14, ]
+        proprio = observation_window[-1]['qpos']
+        # unsqueeze to [1, 14]
+        proprio = proprio.unsqueeze(0)
+        
+        # actions shaped as [1, 64, 14] in format [left, right]
+        actions = policy.step(
+            proprio=proprio,
+            images=images,
+            text_embeds=lang_embeddings 
+        ).squeeze(0).cpu().numpy()
+        # print(f"inference_actions: {actions.squeeze()}")
+        
+        print(f"Model inference time: {time.time() - time1} s")
+        
+        # print(f"Finish inference_thread_fn: t={t}")
+        return actions
+
+
+# Main loop for the manipulation task
+def model_inference(args, config, ros_operator: RosOperator):
+    global lang_embeddings
+    
+    # Load rdt model
+    policy = make_policy(args)
+    
+    lang_dict = torch.load(args.lang_embeddings_path)
+    print(f"Running with instruction: \"{lang_dict['instruction']}\" from \"{lang_dict['name']}\"")
+    lang_embeddings = lang_dict["embeddings"]
+    
+    max_publish_step = config['episode_len']
+    chunk_size = config['chunk_size']
+
+    # Initialize position of the puppet arm
+    # for airbot play
+    left = [-0.05664911866188049,-0.26874953508377075,0.5613412857055664,1.483367681503296,-1.1999313831329346,-1.3498512506484985,0]
+    right = [-0.05664911866188049,-0.26874953508377075,0.5613412857055664,-1.483367681503296,1.1999313831329346,1.3498512506484985,0]
+    ros_operator.puppet_arm_publish_continuous(left, right)
+    input("Press enter to continue")
+    # Initialize the previous action to be the initial robot state
+    pre_action = np.zeros(config['state_dim'])
+    pre_action[:14] = np.array(left + right)
+    action = None
+    paused = False
+    from pynput import keyboard
+    def on_press(key):
+        nonlocal paused
+        if key.char == 'p':
+            paused = not paused
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    # Inference loop
+    with torch.inference_mode():
+        while True and not rospy.is_shutdown():
+            # The current time step
+            t = 0
+            rate = rospy.Rate(args.publish_rate)
+    
+            action_buffer = np.zeros([chunk_size, config['state_dim']])
+            
+            while t < max_publish_step and not rospy.is_shutdown():
+                # Update observation window
+                update_observation_window(args, config, ros_operator)
+                
+                # When coming to the end of the action chunk
+                if t % chunk_size == 0:
+                    # Start inference
+                    action_buffer = inference_fn(args, config, policy, t).copy()
+                    paused = False
+                
+                raw_action = action_buffer[t % chunk_size]
+                action = raw_action
+                # Interpolate the original action sequence
+                if args.use_actions_interpolation:
+                    # print(f"Time {t}, pre {pre_action}, act {action}")
+                    interp_actions = interpolate_action(args, pre_action, action)
+                else:
+                    interp_actions = action[np.newaxis, :]
+                # Execute the interpolated actions one by one
+                for act in interp_actions:
+                    if paused:
+                        print("Paused")
+                        t += (chunk_size - t % chunk_size - 1)
+                        time.sleep(1)
+                        break
+                    left_action = act[:7]
+                    right_action = act[7:14]
+                    
+                    if not args.disable_puppet_arm:
+                        ros_operator.puppet_arm_publish(left_action, right_action)  # puppet_arm_publish_continuous_thread
+                
+                    if args.use_robot_base:
+                        vel_action = act[14:16]
+                        ros_operator.robot_base_publish(vel_action)
+                    rate.sleep()
+                    # print(f"doing action: {act}")
+                t += 1
+                
+                print("Published Step", t)
+                pre_action = action.copy()
 
 
 def get_arguments():
@@ -592,10 +586,8 @@ def get_arguments():
     parser.add_argument('--img_right_depth_topic', action='store', type=str, help='img_right_depth_topic',
                         default='/camera_r/depth/image_raw', required=False)
     
-    parser.add_argument('--puppet_arm_left_cmd_topic', action='store', type=str, help='puppet_arm_left_cmd_topic',
-                        default='/master/joint_left', required=False)
-    parser.add_argument('--puppet_arm_right_cmd_topic', action='store', type=str, help='puppet_arm_right_cmd_topic',
-                        default='/master/joint_right', required=False)
+    parser.add_argument('--puppet_arm_cmd_topic', action='store', type=str, help='puppet_arm_right_cmd_topic',
+                        default='/master/joint', required=False)
     parser.add_argument('--puppet_arm_left_topic', action='store', type=str, help='puppet_arm_left_topic',
                         default='/puppet/joint_left', required=False)
     parser.add_argument('--puppet_arm_right_topic', action='store', type=str, help='puppet_arm_right_topic',
@@ -640,6 +632,8 @@ def get_arguments():
     
     parser.add_argument('--lang_embeddings_path', type=str, required=True, 
                         help='Path to the pre-encoded language instruction embeddings')
+    
+    parser.add_argument('--right', type=bool, required=False, default=False, help='Whether to only use the right arm')
     
     args = parser.parse_args()
     return args
